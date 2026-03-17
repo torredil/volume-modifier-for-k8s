@@ -115,6 +115,28 @@ func TestModify(t *testing.T) {
 	}
 }
 
+func TestModify_NonCSINonMigratedPV(t *testing.T) {
+	client := csi.NewFakeClient("unknown.driver.io", true, false)
+	k8sClient := getFakeKubernetesClient()
+	modifier, err := NewFromClient("unknown.driver.io", client, k8sClient, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// PV with no CSI source and a non-migrated driver
+	pv := &v1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pv"},
+		Spec: v1.PersistentVolumeSpec{
+			PersistentVolumeSource: v1.PersistentVolumeSource{
+				HostPath: &v1.HostPathVolumeSource{Path: "/tmp"},
+			},
+		},
+	}
+	err = modifier.Modify(pv, map[string]string{"foo": "bar"}, map[string]string{})
+	if err == nil {
+		t.Fatal("expected error for non-CSI non-migrated PV, got nil")
+	}
+}
+
 func newFakeInTreePV(name, volumeID string) *v1.PersistentVolume {
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
@@ -159,5 +181,5 @@ func newFakeCSIPV(name, driverName, volumeID string) *v1.PersistentVolume {
 }
 
 func getFakeKubernetesClient() kubernetes.Interface {
-	return fake.NewSimpleClientset()
+	return fake.NewClientset()
 }

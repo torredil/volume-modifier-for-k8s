@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	csi "github.com/awslabs/volume-modifier-for-k8s/pkg/client"
 	"github.com/awslabs/volume-modifier-for-k8s/pkg/controller"
 
 	v1 "k8s.io/api/coordination/v1"
@@ -13,6 +14,9 @@ import (
 	"github.com/golang/mock/gomock"
 )
 
+// workerCount is the default value of the *workers flag used by leaseHandler.
+const workerCount = 10
+
 func TestLeaseHandler_PodIsLeader(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -20,7 +24,7 @@ func TestLeaseHandler_PodIsLeader(t *testing.T) {
 	mockModifyController := controller.NewMockModifyController(ctrl)
 
 	signalChannel := make(chan struct{}, 1)
-	mockModifyController.EXPECT().Run(gomock.Any(), gomock.Any()).Do(
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Do(
 		func(_ int, _ context.Context) {
 			t.Log("Run was called")
 			signalChannel <- struct{}{}
@@ -43,7 +47,7 @@ func TestLeaseHandler_PodIsNotLeader(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockModifyController := controller.NewMockModifyController(ctrl)
-	mockModifyController.EXPECT().Run(gomock.Any(), gomock.Any()).Times(0)
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Times(0)
 
 	lease := newLease("external-resizer-ebs-csi-aws-com", "other-pod")
 	runLeaseHandlerAndSendLease(t, "test-pod", mockModifyController, lease)
@@ -59,7 +63,7 @@ func TestLeaseHandler_PodRegainsLeadership(t *testing.T) {
 	secondSignalChannel := make(chan struct{}, 1)
 
 	// Expect Run to be called once initially, signal via first channel
-	mockModifyController.EXPECT().Run(gomock.Any(), gomock.Any()).Do(
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Do(
 		func(_ int, _ context.Context) {
 			t.Log("First Run was called")
 			firstSignalChannel <- struct{}{}
@@ -67,7 +71,7 @@ func TestLeaseHandler_PodRegainsLeadership(t *testing.T) {
 	).Times(1)
 
 	// Expect Run to be called again after leadership loss, signal via second channel
-	mockModifyController.EXPECT().Run(gomock.Any(), gomock.Any()).Do(
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Do(
 		func(_ int, _ context.Context) {
 			t.Log("Second Run was called")
 			secondSignalChannel <- struct{}{}
@@ -103,7 +107,7 @@ func TestLeaseHandler_RunCalledOnce(t *testing.T) {
 
 	signalChannel := make(chan struct{}, 1)
 
-	mockModifyController.EXPECT().Run(gomock.Any(), gomock.Any()).Do(
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Do(
 		func(_ int, _ context.Context) {
 			t.Log("Run was called")
 			signalChannel <- struct{}{}
@@ -127,6 +131,53 @@ func TestLeaseHandler_RunCalledOnce(t *testing.T) {
 	}
 }
 
+func TestGetDriverName(t *testing.T) {
+	client := csi.NewFakeClient("ebs.csi.aws.com", true, false)
+	name, err := getDriverName(client, 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if name != "ebs.csi.aws.com" {
+		t.Fatalf("expected driver name %q, got %q", "ebs.csi.aws.com", name)
+	}
+}
+
+func TestLeaseHandler_ChannelClosed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockModifyController := controller.NewMockModifyController(ctrl)
+
+	signalChannel := make(chan struct{}, 1)
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Do(
+		func(_ int, ctx context.Context) {
+			t.Log("Run was called")
+			signalChannel <- struct{}{}
+			<-ctx.Done()
+		},
+	).Times(1)
+
+	leaseChannel := make(chan *v1.Lease, 2)
+
+	done := make(chan struct{})
+	go func() {
+		leaseHandler("test-pod", func() controller.ModifyController { return mockModifyController }, leaseChannel)
+		close(done)
+	}()
+
+	// Become leader, then close channel
+	leaseChannel <- newLease("external-resizer-ebs-csi-aws-com", "test-pod")
+	<-signalChannel
+	close(leaseChannel)
+
+	select {
+	case <-done:
+		t.Log("leaseHandler returned after channel close")
+	case <-time.After(2 * time.Second):
+		t.Fatal("leaseHandler did not return after channel close")
+	}
+}
+
 func newLease(name, holderIdentity string) *v1.Lease {
 	return &v1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
@@ -143,4 +194,61 @@ func runLeaseHandlerAndSendLease(t *testing.T, podName string, mockModifyControl
 	go leaseHandler(podName, func() controller.ModifyController { return mockModifyController }, leaseChannel)
 	leaseChannel <- lease
 	close(leaseChannel)
+}
+
+func TestLeaseHandler_NonLeaderToNonLeader(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockModifyController := controller.NewMockModifyController(ctrl)
+	// Run should never be called since we're never the leader
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Times(0)
+
+	leaseChannel := make(chan *v1.Lease, 3)
+
+	done := make(chan struct{})
+	go func() {
+		leaseHandler("test-pod", func() controller.ModifyController { return mockModifyController }, leaseChannel)
+		close(done)
+	}()
+
+	// Multiple lease updates where someone else is always the leader
+	leaseChannel <- newLease("external-resizer-ebs-csi-aws-com", "other-pod-1")
+	leaseChannel <- newLease("external-resizer-ebs-csi-aws-com", "other-pod-2")
+	leaseChannel <- newLease("external-resizer-ebs-csi-aws-com", "other-pod-3")
+	close(leaseChannel)
+
+	select {
+	case <-done:
+		t.Log("leaseHandler returned cleanly")
+	case <-time.After(2 * time.Second):
+		t.Fatal("leaseHandler did not return after channel close")
+	}
+}
+
+func TestLeaseHandler_ChannelClosedWhileNotLeader(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockModifyController := controller.NewMockModifyController(ctrl)
+	mockModifyController.EXPECT().Run(gomock.Eq(workerCount), gomock.Not(gomock.Nil())).Times(0)
+
+	leaseChannel := make(chan *v1.Lease, 1)
+
+	done := make(chan struct{})
+	go func() {
+		leaseHandler("test-pod", func() controller.ModifyController { return mockModifyController }, leaseChannel)
+		close(done)
+	}()
+
+	// Never become leader, just close
+	leaseChannel <- newLease("external-resizer-ebs-csi-aws-com", "other-pod")
+	close(leaseChannel)
+
+	select {
+	case <-done:
+		t.Log("leaseHandler returned after channel close while not leader")
+	case <-time.After(2 * time.Second):
+		t.Fatal("leaseHandler did not return")
+	}
 }

@@ -19,6 +19,14 @@ proto:
 test:
 	go test ./... -race
 
+.PHONY: test/coverage
+test/coverage:
+	go test -coverprofile=cover.out ./cmd/... ./pkg/controller/... ./pkg/modifier/... ./pkg/util/...
+	grep -vE "mock_" cover.out > filtered_cover.out
+	go tool cover -func=filtered_cover.out
+	go tool cover -html=filtered_cover.out -o coverage.html
+	rm cover.out filtered_cover.out
+
 .PHONY: clean
 clean:
 	rm -rf bin/
